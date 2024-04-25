@@ -1,0 +1,240 @@
+#!/bin/bash
+
+grub_file='/etc/default/grub'
+meta_file='/etc/gpu-pt.conf'
+vfio_override_script='/usr/sbin/vfio-pci-override.sh'
+dracut_module_dir='/usr/lib/dracut/modules.d/25load_vfio'
+dracut_module_setup_file=$dracut_module_dir/module-setup.sh
+dracut_module_override_link=$dracut_module_dir/vfio-pci-override.sh
+
+# Function to execute when disabling GPU passthrough
+disable_gpu_passthrough() {
+    # Insert your script code here
+    echo "Disabling GPU passthrough..." 
+    
+    modprobe_file="/etc/modprobe.d/vfio.conf"
+    [ -e $modprobe_file ] && rm $modprobe_file
+    dracut_file="/etc/dracut.conf.d/vfio.conf"
+    [ -e $dracut_file ] && rm $dracut_file
+
+   sed -i 's/ amd_iommu=on iommu=pt isolcpus=2-7 nohz_full=2-7 rcu_nocbs=2-7 rd.driver.pre=vfio-pci vfio pci.ids=.* transparent_hugepage=never//g' $grub_file
+
+    
+    if [ -f "$meta_file" ]; then
+        vga=$(jq -r '.VGA' <<< cat $meta_file)
+        audio=$(jq -r '.Audio' <<< cat $meta_file)
+
+        vga_drv_override="/sys/bus/pci/devices/0000:$vga/driver_override"
+        [ -e $vga_drv_override ] && rm $vga_drv_override
+
+        audio_drv_override="/sys/bus/pci/devices/0000:$audio/driver_override"
+        [ -e $audio_drv_override ] && rm $audio_drv_override
+
+        rm $meta_file
+    fi
+
+
+    [ -e $vfio_override_script ] && rm $vfio_override_script        
+    [ -e $dracut_module_override_link ] && rm $dracut_module_override_link
+    [ -d $dracut_module_dir ] && rm -r $dracut_module_dir
+
+    modprobe -r vfio-pci
+
+
+    dracut-rebuild
+    grub-mkconfig -o /boot/grub/grub.cfg
+    echo "GPU passthrough disabled." 
+}
+
+# Function to execute when enabling/changing GPU passthrough
+enable_change_gpu_passthrough() {
+    disable_gpu_passthrough
+    index=$1
+    gpu_list=$2
+    # Insert your script code here
+    display_name=$(jq -r '.['$index'].DisplayName' <<< "$2")
+    echo "Enabling/Changing GPU passthrough for:" $display_name
+    gpu=$(jq -r '.['$index']' <<< "$2")
+
+    grub_conf=' amd_iommu=on iommu=pt isolcpus=2-7 nohz_full=2-7 rcu_nocbs=2-7 rd.driver.pre=vfio-pci vfio pci.ids='$vga','$audio' transparent_hugepage=never'
+
+    echo "Saving " $grub_conf "to file: " $grub_file
+    sed -i "s|\(GRUB_CMDLINE_LINUX_DEFAULT=.*\)'|\1$grub_conf'|" $grub_file
+
+tee $meta_file >/dev/null <<EOF
+    $gpu
+EOF
+    vga=$(jq -r '.['$index'].VGA' <<< "$2")
+    audio=$(jq -r '.['$index'].Audio' <<< "$2")
+
+    modprobe_file="/etc/modprobe.d/vfio.conf"    
+    dracut_file="/etc/dracut.conf.d/vfio.conf"
+
+tee $modprobe_file >/dev/null <<EOF
+    softdep drm pre: vfio-pci    
+    softdep amdgpu pre: vfio vfio_pci
+    options vfio-pci ids=$vga,$audio
+EOF
+
+tee $dracut_file >/dev/null <<EOF
+    add_dracutmodules+=" load_vfio "
+    force_drivers+=" vfio vfio-pci vfio_iommu_type1 "
+    install_items="/usr/sbin/vfio-pci-override.sh /usr/bin/find /usr/bin/dirname"    
+EOF
+
+
+tee $vfio_override_script >/dev/null <<EOF
+ #!/bin/sh
+ DEVICE_LOCATIONS="0000:$vga 0000:$audio"
+ for LOCATION in \$DEVICE_LOCATIONS; do
+  cat "vfio-pci" > /sys/bus/pci/devices/\$LOCATION/driver_override
+ done
+ modprobe -i vfio-pci
+EOF
+
+    chmod +x $vfio_override_script
+
+    mkdir $dracut_module_dir
+
+tee $dracut_module_setup_file >/dev/null <<EOF
+#!/usr/bin/bash
+ check() {
+    return 0
+ }
+ depends() {
+    return 0
+ }
+ install() {
+    declare moddir=\${moddir}
+    inst_hook pre-udev 00 "\$moddir/vfio-pci-override.sh"
+ }
+EOF
+
+    chmod +x $dracut_module_setup_file
+
+    ln -s $vfio_override_script $dracut_module_override_link
+    
+    grub-mkconfig -o /boot/grub/grub.cfg
+
+    dracut-rebuild
+}
+
+get_gpu_devices() {
+    # Get information about VGA devices using lspci
+    vga_devices=$(lspci -nn | grep '\[03')
+
+    # Get detailed information about display devices using lshw in JSON format
+    display_devices=$(lshw -C display -json)
+
+    # Initialize an empty array to store the GPU devices
+    declare -a gpu_devices
+
+
+# Loop through each line of lspci output
+    while IFS= read -r vga_line; do
+        # Extract the bus ID and PCI ID of the GPU
+        bus_id=$(echo "$vga_line" | awk '{print $1}')
+        pci_id=$(echo "$vga_line" | awk -F'[][]' '{print $(NF-1)}')
+
+        # Extract the PCI group number of the VGA device
+        pci_group=$(echo $bus_id | awk -F'.' '{print $1}')
+   
+        # Use jq to parse JSON and extract the GPU model name (DisplayName)
+        display_name=$(echo "$display_devices" | jq -r ".[] | select(.businfo | endswith(\"$bus_id\")).product")
+        vga_id=$pci_id
+
+        # Extract the audio group based on the VGA device        
+        audio_id=$(lspci -nn | grep "\[04" | awk -v group="$pci_group" -F "." '$1 == group {print $0}' |  awk -F'[][]' '{print $(NF-1)}')
+    
+        # Add the GPU device object to the array
+         # Create an associative array for the GPU device
+        gpu_device="{\"DisplayName\":\"$display_name\", \"VGA\":\"$vga_id\", \"Audio\":\"$audio_id\"}"
+
+
+        # Add the GPU device object to the array
+        gpu_devices+=("$gpu_device")
+    done <<< "$vga_devices"
+
+    local gpu_devices_array=$(printf "%s\n" "${gpu_devices[@]}" | jq -s '.')
+
+    # Output the GPU devices array as JSON
+    echo $gpu_devices_array
+}
+
+
+# Main menu function
+main_menu() {
+    while true; do
+        choice=$(whiptail --clear \
+                          --backtitle "GPU Passthrough Menu" \
+                          --title "Main Menu" \
+                          --menu "Choose an option:" \
+                          15 50 4 \
+                          "Enable/Change" "Enable or change GPU passthrough" \
+                          "Disable" "Disable GPU passthrough" \
+                          "Quit" "Exit the menu" \
+                          3>&1 1>&2 2>&3)
+
+        case $choice in
+            "Enable/Change")
+                enable_change_menu
+                ;;
+            "Disable")
+                disable_gpu_passthrough
+		exit 0
+                ;;
+            "Quit")
+                echo "Exiting..."
+                exit 0
+                ;;
+        esac
+    done
+}
+
+# Enable/Change menu function
+enable_change_menu() {
+	# Call the function and store the result in a variable
+    gpu_list=$(get_gpu_devices)
+
+    # Initialize an empty array to store the menu options
+    menu_options=()
+        
+    while read gpu; do
+       # Extract fields from JSON object
+       display_name=$(jq -r '.DisplayName' <<< "$gpu")
+       menu_options+=("$display_name" "")
+    done <<<$(echo $gpu_list | jq -c '.[]')
+    
+    while true; do
+        choice=$(whiptail --clear \
+                          --backtitle "GPU Passthrough Menu" \
+                          --title "Enable/Change Menu" \
+                          --menu "Choose an option or 'Return' to go back:" \
+                          15 70 4 \
+			  "${menu_options[@]}" \
+                          3>&1 1>&2 2>&3)
+        exitstatus=$?
+
+        [[ "$exitstatus" = 1 ]] && break;
+
+        case $choice in
+            "Return")
+                break
+                ;;
+            1)
+                exit 0
+                ;;
+            *)
+                # Find the index of the selected option
+                index=$(echo "${menu_options[@]}" | grep -o "\b$choice\b" | wc -w)
+                # Pass the index and gpu_list to the enable_change_gpu_passthrough function
+                enable_change_gpu_passthrough "$index" "$gpu_list"
+                exit 0
+                ;;
+        esac
+	done
+}
+
+# Start the main menu
+main_menu
+
